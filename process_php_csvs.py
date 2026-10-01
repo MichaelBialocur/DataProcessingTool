@@ -1287,6 +1287,12 @@ def tsat_result_columns(results):
     return [c for c in columns if re.fullmatch(r'T_SAT(?:_\d+)? \[°C\]', str(c))]
 
 
+def superheating_result_columns(results):
+    """One superheating metric for each independently measured saturation pressure."""
+    columns = results.columns if hasattr(results, 'columns') else results
+    return [c for c in columns if re.fullmatch(r'Superheating(?:_\d+)? \[K\]', str(c))]
+
+
 def lts_saturation_averages(detail, column, settings):
     fluid = detail['metadata']['fluid']
     if detail.get('schedule'):
@@ -1330,9 +1336,13 @@ def add_lts_psat_results(all_results, test_details, configuration):
             temperature_metric = metric.replace('Psat', 'T_SAT').replace('[bar abs]', '[°C]')
             if not np.isfinite(temperatures).all():
                 print(f"{detail['source_file']}: some {temperature_metric} values unavailable: {temperature_note}")
+            superheating_metric = metric.replace('Psat', 'Superheating').replace('[bar abs]', '[K]')
             for row, value, temperature in zip(target_rows, pressure, temperatures):
                 row[metric] = float(value) if np.isfinite(value) and value > 0 else np.nan
                 row[temperature_metric] = float(temperature) if np.isfinite(temperature) else np.nan
+                evap_out = pd.to_numeric(row.get('T_EVAP_OUT [°C]', np.nan), errors='coerce')
+                row[superheating_metric] = (float(evap_out - temperature)
+                    if pd.notna(evap_out) and np.isfinite(evap_out) and np.isfinite(temperature) else np.nan)
     return rows
 
 
@@ -1404,11 +1414,100 @@ def draw_psat_comparison_page(pdf, results, metric, page_number):
     draw_page_footer(pdf, page_number, width)
 
 
+def superheating_subcooling_groups(results):
+    """Keep assemblies/fluids separate and paginate long condition legends."""
+    if results.empty:
+        return
+    keys = [c for c in ['Evaporator Name', 'Condenser Name', 'Working Fluid', 'Coolant', 'Condition Type'] if c in results]
+    groups = (group for _, group in results.groupby(keys, sort=True, dropna=False)) if keys else [results]
+    for group in groups:
+        metrics = superheating_result_columns(group) or ['Superheating [K]']
+        sources = list(group['Source File'].drop_duplicates())
+        for metric in metrics:
+            for start in range(0, len(sources), 6):
+                yield group[group['Source File'].isin(sources[start:start+6])], metric
+
+
+def make_superheating_subcooling_chart(results, metric, configuration):
+    """Compare both temperature differences without combining distinct plateaus."""
+    figure, axes = plt.subplots(1, 2, figsize=(11.2, 5.9))
+    subcooling_limit, _, superheating_limit = summary_red_thresholds(configuration)
+    colors = plt.get_cmap('tab10')
+    handles, labels = [], []
+    for index, (source, source_data) in enumerate(results.groupby('Source File', sort=True)):
+        first = source_data.iloc[0]
+        condition = (f"FR {format_number(first['Condition Value'])}%" if first['Condition Type'] == 'FR'
+                     else f"Charge {format_number(first['Condition Value'])}")
+        label = (f"{condition} | {first['Flow Type']} {format_number(first['Nominal Flow Rate'])}"
+                 f" | {'T_AIR' if first['Flow Type'] == 'CFM' else 'TW'} {format_number(first['Nominal T_IN [°C]'])}°C")
+        orientation = str(first.get('Orientation', '')).strip()
+        if orientation and orientation.lower() not in ('nan', 'n/a', 'none'):
+            label += f' | {orientation}'
+        comment = str(first.get('Comment', '')).strip()
+        if comment and comment.lower() != 'nan':
+            label += ' | ' + comment
+        if label in labels:
+            label += f' | Run {index+1}'
+        labels.append(label)
+        series = source_data.sort_values('W_IN [W]', kind='stable')
+        for axis, column in zip(axes, [metric, 'Subcooling [K]']):
+            values = pd.to_numeric(series.get(column, pd.Series(np.nan, index=series.index)), errors='coerce')
+            # Do not average identical total loads: heterogeneous CPU distributions may differ.
+            line, = axis.plot(series['W_IN [W]'], values, marker='o', markersize=4,
+                              linewidth=1.5, color=colors(index % 10), label=label)
+            if axis is axes[0]:
+                handles.append(line)
+    for axis, column, title, limit in zip(axes, [metric, 'Subcooling [K]'],
+            ['Superheating', 'Subcooling'], [superheating_limit, subcooling_limit]):
+        axis.set_title(title, fontsize=12)
+        style_report_axis(axis, 'Total heat load [W]', column)
+        axis.axhline(limit, color='#A52424', linestyle='--', linewidth=1,
+                     label=f'Red-cell threshold: {limit:g} K')
+        axis.text(.02, .98, f'Threshold: {limit:g} K', transform=axis.transAxes,
+                  ha='left', va='top', color='#A52424', fontsize=8,
+                  bbox={'facecolor': 'white', 'edgecolor': 'none', 'alpha': .85, 'pad': 1.5})
+        values = pd.to_numeric(results.get(column, pd.Series(dtype=float)), errors='coerce')
+        if not np.isfinite(values).any():
+            axis.text(.5, .5, 'Unavailable: measured Psat, refrigerant properties\nand T_EVAP_OUT are required.' if title == 'Superheating'
+                      else 'Subcooling data unavailable.', transform=axis.transAxes,
+                      ha='center', va='center', fontsize=9)
+    figure.legend(handles, labels, loc='lower center', bbox_to_anchor=(.5, .015),
+                  ncol=1, fontsize=8, frameon=False)
+    figure.tight_layout(rect=(0, .10 + .033*len(labels), 1, 1), pad=1.5)
+    buffer = BytesIO()
+    figure.savefig(buffer, format='png', dpi=180, facecolor='white')
+    plt.close(figure)
+    buffer.seek(0)
+    return buffer
+
+
+def draw_superheating_subcooling_page(pdf, results, metric, page_number, configuration):
+    width, height = landscape(A4)
+    pdf.setFillColor(report_dark)
+    pdf.setFont(report_bold_font, 16)
+    pdf.drawString(32, height-32, 'Superheating and subcooling')
+    first = results.iloc[0]
+    subtitle = (f"EVAP: {first.get('Evaporator Name', '')} | COND: {first.get('Condenser Name', '')} | "
+                f"Fluid: {first.get('Working Fluid', '')} | {metric}")
+    pdf.setFillColor(report_grey)
+    draw_wrapped_text(pdf, subtitle, 32, height-50, width-64, font_size=8, leading=10, maximum_lines=2)
+    pdf.setStrokeColor(report_light_grey)
+    pdf.line(32, height-72, width-32, height-72)
+    chart = make_superheating_subcooling_chart(results, metric, configuration)
+    pdf.drawImage(ImageReader(chart), 26, 58, width=width-52, height=height-134,
+                  preserveAspectRatio=True, anchor='c')
+    chart.close()
+    pdf.setFont(report_regular_font, 7)
+    pdf.drawString(32, 45, 'Superheating = T_EVAP_OUT - T_SAT(Psat, refrigerant). Subcooling = T_COND_IN - T_COND_OUT.')
+    pdf.drawString(32, 34, '1 K temperature difference = 1°C. Dashed lines show the selected summary red-cell thresholds.')
+    draw_page_footer(pdf, page_number, width)
+
+
 def summary_value_options(results, part_type, test_details=None):
     """Available numeric results and established defaults for the PDF table."""
     frame = pd.DataFrame(results) if results is not None else pd.DataFrame()
     board = is_board_report(frame) or any(is_board_test_detail(d) for d in test_details or [])
-    catalog = ['DeltaT_CU [K]', 'Subcooling [K]', *psat_result_columns(frame), *tsat_result_columns(frame),
+    catalog = ['DeltaT_CU [K]', 'Subcooling [K]', *psat_result_columns(frame), *tsat_result_columns(frame), *superheating_result_columns(frame),
                'W_OUT [W]', 'T_ADIA [°C]', 'T_CU_AVG [°C]', 'T_CU_MIN [°C]', 'T_CU_MAX [°C]',
                'DeltaT_CU_MIN [K]', 'DeltaT_CU_MAX [K]', 'Rth [K/W]',
                'T_EVAP_IN [°C]', 'T_EVAP_OUT [°C]', 'T_COND_IN [°C]', 'T_COND_OUT [°C]',
@@ -1416,7 +1515,7 @@ def summary_value_options(results, part_type, test_details=None):
     # Raw sensor channels can also be selected, without duplicating internal aliases.
     catalog += [c for c in frame.columns if re.fullmatch(r'T_(?:CPU|CU|ADIA)(?:_[A-Za-z0-9]+)* \[°C\]', str(c))
                 and c not in catalog and (not board or re.fullmatch(r'T_CPU_\d+ \[°C\]', str(c)))]
-    available = [c for c in dict.fromkeys(catalog) if c in frame and (pd.to_numeric(frame[c], errors='coerce').notna().any() or c in tsat_result_columns(frame))]
+    available = [c for c in dict.fromkeys(catalog) if c in frame and (pd.to_numeric(frame[c], errors='coerce').notna().any() or c in tsat_result_columns(frame) or c in superheating_result_columns(frame))]
     # Pressure averages are added after the user chooses the pressure settings.
     if part_type == 'LTS':
         for detail in test_details or []:
@@ -1424,7 +1523,8 @@ def summary_value_options(results, part_type, test_details=None):
                 base = re.split(r'[\[(]', str(column))[0].strip()
                 number = re.search(r'(\d+)$', base)
                 metric = 'Psat' + ('_'+str(int(number[1])) if number else '') + ' [bar abs]'
-                for result_metric in [metric, metric.replace('Psat', 'T_SAT').replace('[bar abs]', '[°C]')]:
+                for result_metric in [metric, metric.replace('Psat', 'T_SAT').replace('[bar abs]', '[°C]'),
+                                      metric.replace('Psat', 'Superheating').replace('[bar abs]', '[K]')]:
                     if result_metric not in available:
                         available.append(result_metric)
     defaults = ['DeltaT_CU [K]']
@@ -1488,15 +1588,18 @@ def row_summary_payload(results, selected_values):
 def summary_red_thresholds(configuration):
     subcooling = float(configuration.get('summary_subcooling_limit', 5.0))
     cpu = float(configuration.get('summary_cpu_temperature_limit', 100.0))
-    if not (math.isfinite(subcooling) and math.isfinite(cpu)):
+    superheating = float(configuration.get('summary_superheating_limit', 1.0))
+    if not all(math.isfinite(v) for v in (subcooling, cpu, superheating)):
         raise ValueError('Summary thresholds must be finite numbers.')
-    return subcooling, cpu
+    return subcooling, cpu, superheating
 
 
 def summary_cell_exceeds_limit(column, value, results, configuration):
     if not isinstance(value, (int, float, np.number)) or not np.isfinite(value):
         return False
-    subcooling, cpu = summary_red_thresholds(configuration)
+    subcooling, cpu, superheating = summary_red_thresholds(configuration)
+    if column in superheating_result_columns([column]):
+        return value > superheating
     if column == 'Subcooling [K]':
         return value > subcooling
     label = summary_value_label(column, results)
@@ -1510,7 +1613,7 @@ def draw_condition_summary_pages(pdf, results, part_type, page_number, configura
     chosen = configuration.get('summary_value_columns')
     selected = defaults if chosen is None else [c for c in dict.fromkeys(chosen) if c in available]
     frame, fixed, metrics, context = row_summary_payload(results, selected)
-    subcooling_limit, cpu_limit = summary_red_thresholds(configuration)
+    subcooling_limit, cpu_limit, superheating_limit = summary_red_thresholds(configuration)
     group_columns = [c for c in ['Part Name', 'Evaporator Name', 'Condenser Name', 'Working Fluid',
         'Coolant', 'Condition Type', 'Condition Value', 'Flow Type', 'Nominal Flow Rate',
         'Nominal T_IN [°C]', 'Orientation'] if c in frame]
@@ -1572,7 +1675,7 @@ def draw_condition_summary_pages(pdf, results, part_type, page_number, configura
                     pdf.setLineWidth(.5)
             pdf.setFillColor(report_grey)
             pdf.setFont(report_regular_font,7)
-            pdf.drawString(32,42, f'Red cells: Subcooling > {subcooling_limit:g} K; T_CPU > {cpu_limit:g}°C. Blank cells: unavailable results.')
+            pdf.drawString(32,42, f'Red cells: Subcooling > {subcooling_limit:g} K; Superheating > {superheating_limit:g} K; T_CPU > {cpu_limit:g}°C. Blanks: unavailable.')
             draw_page_footer(pdf,page_number,width)
     return page_number
 
@@ -1628,6 +1731,8 @@ def default_report_configuration(
         "include_test_summary": board_tests or bool(has_filling_ratio_analysis),
         "summary_value_columns": None,
         "summary_subcooling_limit": 5.0,
+        "summary_superheating_limit": 1.0,
+        "include_superheating_subcooling": any(d["metadata"].get("part_type") == "LTS" and not is_transient_detail(d) for d in test_details),
         "summary_cpu_temperature_limit": 100.0,
         "selected_detail_files": {d["source_file"] for d in test_details if not is_transient_detail(d)},
         "selected_raw_files": {detail["source_file"] for detail in test_details},
@@ -1928,6 +2033,10 @@ def show_report_configuration_dialog(
             psu_checkbox.state(['disabled'])
 
     psat_comparison_variable = tk.BooleanVar(value=defaults['include_psat_comparison'])
+    superheating_variable = tk.BooleanVar(value=defaults['include_superheating_subcooling'])
+    if part_type == 'LTS':
+        ttk.Checkbutton(options_frame, text='Include superheating and subcooling comparison pages',
+                        variable=superheating_variable).grid(row=16, column=0, columnspan=2, sticky='w', pady=(8,0))
     ph_variable = tk.BooleanVar(value=False)
     ph_estimated_variable = tk.BooleanVar(value=False)
     ph_endpoints_variable = tk.BooleanVar(value=True)
@@ -2006,10 +2115,14 @@ def show_report_configuration_dialog(
     thresholds_frame.grid(row=14, column=0, columnspan=2, sticky='ew', pady=(8,0))
     subcooling_limit_variable = tk.StringVar(value='5')
     cpu_limit_variable = tk.StringVar(value='100')
-    ttk.Label(thresholds_frame, text='Subcooling above [K = °C difference]:').pack(side='left')
-    ttk.Entry(thresholds_frame, textvariable=subcooling_limit_variable, width=7).pack(side='left', padx=(5,18))
-    ttk.Label(thresholds_frame, text='T_CPU above [°C]:').pack(side='left')
-    ttk.Entry(thresholds_frame, textvariable=cpu_limit_variable, width=7).pack(side='left', padx=5)
+    superheating_limit_variable = tk.StringVar(value='1')
+    ttk.Label(thresholds_frame, text='Subcooling above [K = °C difference]:').grid(row=0, column=0, sticky='w')
+    ttk.Entry(thresholds_frame, textvariable=subcooling_limit_variable, width=7).grid(row=0, column=1, padx=(5,18))
+    ttk.Label(thresholds_frame, text='T_CPU above [°C]:').grid(row=0, column=2, sticky='w')
+    ttk.Entry(thresholds_frame, textvariable=cpu_limit_variable, width=7).grid(row=0, column=3, padx=5)
+    if part_type == 'LTS':
+        ttk.Label(thresholds_frame, text='Superheating above [K = °C difference]:').grid(row=1, column=0, sticky='w', pady=(6,0))
+        ttk.Entry(thresholds_frame, textvariable=superheating_limit_variable, width=7).grid(row=1, column=1, padx=(5,18), pady=(6,0))
 
     details_frame = ttk.LabelFrame(options_frame, text='Tests for extra details: Psat / T_sat, PSU temperatures and p-h', padding=8)
     details_frame.grid(row=15, column=0, columnspan=2, sticky='ew', pady=(10,0))
@@ -2184,12 +2297,13 @@ def show_report_configuration_dialog(
 
     def accept_configuration():
         try:
-            subcooling_limit, cpu_limit = summary_red_thresholds({
+            subcooling_limit, cpu_limit, superheating_limit = summary_red_thresholds({
                 'summary_subcooling_limit': subcooling_limit_variable.get().replace(',', '.'),
+                'summary_superheating_limit': superheating_limit_variable.get().replace(',', '.'),
                 'summary_cpu_temperature_limit': cpu_limit_variable.get().replace(',', '.'),
             })
         except (ValueError, TypeError):
-            messagebox.showerror('Invalid summary threshold', 'Enter finite numbers for both thresholds.', parent=root)
+            messagebox.showerror('Invalid summary threshold', 'Enter finite numbers for all thresholds.', parent=root)
             return
         selected_detail_files = {name for name, variable in detail_variables.items() if variable.get()}
         include_colormaps = colormap_variable.get()
@@ -2263,6 +2377,8 @@ def show_report_configuration_dialog(
             "include_test_summary": summary_variable.get(),
             "summary_value_columns": [c for c,v in summary_value_variables.items() if v.get()],
             "summary_subcooling_limit": subcooling_limit,
+            "summary_superheating_limit": superheating_limit,
+            "include_superheating_subcooling": part_type == "LTS" and superheating_variable.get(),
             "summary_cpu_temperature_limit": cpu_limit,
             "selected_detail_files": selected_detail_files,
             "selected_raw_files": selected_files,
@@ -3113,6 +3229,7 @@ def create_master_excel(
             "Subcooling [K]",
             *psat_result_columns(results),
             *tsat_result_columns(results),
+            *superheating_result_columns(results),
         ]
 
     php_optional_columns = []
@@ -3638,6 +3755,7 @@ def draw_cover_page(
             ("T_COND_IN", "Condenser inlet temperature [°C]"),
             ("T_COND_OUT", "Condenser outlet temperature [°C]"),
             ("Subcooling", "T_COND_IN - T_COND_OUT [K]"),
+            ("Superheating", "T_EVAP_OUT - T_SAT [K]"),
         ])
     elif (
         "T_ADIA [°C]" in results.columns
@@ -6239,17 +6357,6 @@ def create_pdf_report(
             ),
         )
 
-        if part_type == "LTS":
-            pdf.showPage()
-            page_number += 1
-            draw_analysis_page(
-                pdf,
-                analysis_results,
-                "Subcooling [K]",
-                "Filling Ratio Analysis - Subcooling",
-                page_number,
-            )
-
         detailed_group_columns = [
             "Working Fluid",
             "Coolant",
@@ -6320,6 +6427,12 @@ def create_pdf_report(
         pdf.showPage()
         page_number += 1
         page_number = draw_condition_summary_pages(pdf, analysis_results, part_type, page_number, report_configuration)
+
+    if part_type == 'LTS' and report_configuration.get('include_superheating_subcooling', True):
+        for thermal_group, metric in superheating_subcooling_groups(analysis_results):
+            pdf.showPage()
+            page_number += 1
+            draw_superheating_subcooling_page(pdf, thermal_group, metric, page_number, report_configuration)
 
     if part_type == 'LTS' and report_configuration.get('include_psat_comparison', False):
         for pressure_group, metric in psat_comparison_groups(analysis_results):

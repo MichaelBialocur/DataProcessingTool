@@ -28,3 +28,24 @@ NIST REFPROP itself is a separate installation. Property availability depends on
 - **Correlation:** select a reference XLSX workbook and simulation CSV/XLSX, map conditions, and identify the physics/solver configuration. Matching configurations update existing result columns; new configurations add columns. Failed and unmatched runs preserve existing results. Charts retain solver colors, project marker shapes, and parity/deviation lines; project labels remain merged by block.
 
 The source combines the report-processing and correlation-analysis changes developed across the related project conversations. Experimental workbooks and raw measurements are not bundled.
+
+## Superheating and subcooling (LTS / Shift2DC)
+
+Select **Superheating [K]** in the report summary values to include
+`T_EVAP_OUT - T_SAT`. Saturation temperature uses the measured Psat,
+its selected pressure units/reference, and the filename refrigerant with the
+existing CoolProp/REFPROP calculation. Both values use the same plateau averaging
+windows. Missing pressure, temperature, or fluid properties leave the result blank.
+Separate pressure sensors retain separate superheating columns.
+
+The GUI offers a combined **superheating and subcooling comparison** page,
+including single-test campaigns. Superheating above **1 K (1°C difference)** is
+red in the summary by default; its threshold is editable alongside subcooling
+and CPU temperature thresholds. Exactly 1 K is not highlighted. Subcooling keeps
+the established definition `T_COND_IN - T_COND_OUT`.
+
+Run the focused calculation checks with:
+
+```bash
+python -m unittest discover -s tests -v
+```
