@@ -65,3 +65,16 @@ is calculated internally for reports, including transient plots. Boundaries use
 the recorded sample timestamps; consecutive intervals with identical per-CPU
 loads form one plateau. The final 100 seconds of each accepted plateau are used
 for averaging. Partial missing or invalid CPU loads still require correction.
+
+## Excel CPU columns and filling-ratio colors
+
+Each individual `T_CPU_<ID> [°C]` column is immediately followed by its matching
+`W_CPU_<ID> [W]`. Physical CPU IDs determine the pairing, including gaps in the
+numbering and heterogeneous loads. Missing channels stay blank; recorded zero
+loads stay zero. Results from different CSVs continue to stack downwards.
+
+Excel filling-ratio cells and report FR curves use the same color gradient.
+The established anchors remain 40% green, 50% yellow/orange, 60% red, and 70%
+purple. Ratios between anchors blend in RGB (54% is 40% of the way from the
+50% color to the 60% color); ratios outside the anchor range use the nearest
+endpoint color.

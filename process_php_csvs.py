@@ -42,7 +42,8 @@ air_density = 1.204         # kg/m3
 air_cp = 1005.0             # J/(kg K)
 cfm_to_m3_s = 0.00047194745 # m3/s per CFM
 
-# Filling-ratio colors taken from the supplied reference image.
+# Filling-ratio color anchors taken from the supplied reference image.
+# Intermediate ratios interpolate in RGB; outside this range use the end color.
 filling_ratio_colors = {
     70: "7030A0",  # Purple
     60: "FF0000",  # Red
@@ -3027,6 +3028,9 @@ def style_excel(
         "T_CU_MIN [°C]", "T_CU_MAX [°C]", "T_CU_AVG [°C]"
     ]:
         colors[column] = "DDEBF7"
+    for column in headers:
+        if re.fullmatch(r'W_CPU_\d+ \[W\]', str(column)):
+            colors[column] = "F4B183"
     for column in lts_temperature_output_columns:
         colors[column] = "DDEBF7"
     for column in [
@@ -3045,18 +3049,15 @@ def style_excel(
     sheet.cell(1, headers[condition_header]).fill = PatternFill("solid", fgColor="7030A0")
     sheet.cell(1, headers[condition_header]).font = Font(bold=True, color="FFFFFF")
 
-    # Color the filling-ratio cells exactly like the supplied reference:
-    # 70 = purple, 60 = red, 50 = yellow/orange, and 40 = green.
+    # Share the report's FR gradient while preserving the reference anchors.
     if condition_header == "FR [%]":
         condition_column = headers[condition_header]
         for row in range(2, sheet.max_row + 1):
             cell = sheet.cell(row, condition_column)
-            if isinstance(cell.value, (int, float)):
-                for filling_ratio, color in filling_ratio_colors.items():
-                    if abs(float(cell.value) - filling_ratio) < 1e-9:
-                        cell.fill = PatternFill("solid", fgColor=color)
-                        cell.font = Font(color="000000")
-                        break
+            color = interpolated_filling_ratio_color(cell.value)
+            if color is not None:
+                cell.fill = PatternFill("solid", fgColor=color)
+                cell.font = Font(color="000000")
 
     for header in ["T_IN [°C]", "T_OUT [°C]"]:
         sheet.cell(1, headers[header]).font = Font(bold=True, color="FFFFFF")
@@ -3245,11 +3246,20 @@ def create_master_excel(
     ):
         php_optional_columns.append("T_ADIA [°C]")
 
+    # Match physical CPU IDs, not positions: a test may use CPUs 1, 3, 5, etc.
+    # Missing powers remain blank when campaigns have different CPU sets.
+    temperature_power_columns = []
+    for column in all_t_cu_columns:
+        temperature_power_columns.append(column)
+        match = re.fullmatch(r'T_(?:CPU|BOARD)_(\d+) \[°C\]', str(column), re.I)
+        if match:
+            temperature_power_columns.append(f'W_CPU_{int(match[1])} [W]')
+
     final_columns = [
         *component_columns,
         "Working Fluid", "Orientation", condition_header, "Coolant",
         "W_IN [W]", "W_OUT [W]", flow_header, "T_IN [°C]", "T_OUT [°C]",
-        *all_t_cu_columns,
+        *temperature_power_columns,
         *lts_columns,
         *php_optional_columns,
         "T_CU_MIN [°C]", "T_CU_MAX [°C]", "T_CU_AVG [°C]",
@@ -3260,7 +3270,8 @@ def create_master_excel(
         # are stacked by the existing sort, never joined horizontally.
         final_columns.extend([
             "Connected boards", "Power per board [W]", *sorted(
-                [c for c in results if re.fullmatch(r'W_CPU_\d+ \[W\]', str(c))], key=natural_text_sort_key),
+                [c for c in results if re.fullmatch(r'W_CPU_\d+ \[W\]', str(c))
+                 and c not in final_columns], key=natural_text_sort_key),
             "Water / scheduled power [%]",
             "Source File", "Step", "Start [s]", "End [s]",
             "Average from [s]", "Average to [s]", "Sample Count",
@@ -3840,10 +3851,33 @@ def chart_font_sizes(chart_count):
     return 7, 6, 5.5
 
 
+def interpolated_filling_ratio_color(filling_ratio):
+    """Return an RGB hex color shared by Excel and plots, or None if unknown."""
+    try:
+        ratio = float(filling_ratio)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ratio) or not filling_ratio_colors:
+        return None
+    anchors = sorted(filling_ratio_colors)
+    if ratio <= anchors[0]:
+        return filling_ratio_colors[anchors[0]]
+    if ratio >= anchors[-1]:
+        return filling_ratio_colors[anchors[-1]]
+    for lower, upper in zip(anchors, anchors[1:]):
+        if lower <= ratio <= upper:
+            weight = (ratio - lower) / (upper - lower)
+            low_color, high_color = filling_ratio_colors[lower], filling_ratio_colors[upper]
+            return ''.join(
+                f'{round(int(low_color[i:i+2], 16) * (1 - weight) + int(high_color[i:i+2], 16) * weight):02X}'
+                for i in (0, 2, 4)
+            )
+
+
 def filling_ratio_line_color(filling_ratio, fallback_index):
-    for known_ratio, color in filling_ratio_colors.items():
-        if math.isclose(float(filling_ratio), float(known_ratio), abs_tol=1e-9):
-            return f"#{color}"
+    color = interpolated_filling_ratio_color(filling_ratio)
+    if color is not None:
+        return f"#{color}"
     fallback_colors = plt.get_cmap("tab10").colors
     return fallback_colors[fallback_index % len(fallback_colors)]
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
 import process_php_csvs as tool
 
 
@@ -26,7 +27,54 @@ def saved_data():
     return tool.save_shift2dc_schedule_columns(data, boards, schedule)
 
 
+def excel_results():
+    """Different CPU sets, legacy sensor names, and unequal/zero CPU loads."""
+    results = []
+    for ratio in [40, 50, 54, 60, 70]:
+        data, setup = raw_data(), config()
+        if ratio == 54:
+            data = data.rename(columns={'T_CPU_3': 'T_BOARD_10'})
+            setup.update(board_count=2, board_columns=['T_CPU_1', 'T_BOARD_10'],
+                         durations_s=[200.], cpu_powers=[[12.5, 37.5]])
+        boards, steps, schedule = tool.build_shift2dc_steps(data, setup)
+        name = f'Shift2DC_LTS_EVAP-demo_COND-demo_R1336mzzE_FR{ratio}_Water_TW25_VFR2p7_SS.csv'
+        metadata = tool.parse_file_name(Path(name))
+        metadata['source_file'] = name
+        results.extend(tool.shift2dc_result(step, metadata, boards, row)
+                       for step, row in zip(steps, schedule))
+    return results
+
+
 class CPUCsvTests(unittest.TestCase):
+    def test_excel_cpu_pairing_and_fr_colors(self):
+        rows = excel_results()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)/'averages.xlsx'
+            tool.write_shift2dc_excel(rows, output)
+            workbook = load_workbook(output)
+            self.addCleanup(workbook.close)
+            sheet = workbook['Test averages']
+            headers = [cell.value for cell in sheet[1]]
+            self.assertEqual(len(headers), len(set(headers)))
+            self.assertEqual(sheet.max_row, len(rows) + 1)
+            for cpu in [1, 3, 5, 10]:
+                temp = f'T_CPU_{cpu} [°C]'
+                self.assertEqual(headers[headers.index(temp) + 1], f'W_CPU_{cpu} [W]')
+            self.assertLess(headers.index('T_CPU_5 [°C]'), headers.index('T_CPU_10 [°C]'))
+            expected = {(r['Source File'], r['Step']): r for r in rows}
+            colors = {40: '00B050', 50: 'FFC000', 54: 'FF7300', 60: 'FF0000', 70: '7030A0'}
+            for row_index, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):
+                actual = dict(zip(headers, values))
+                source = expected[(actual['Source File'], actual['Step'])]
+                for cpu in [1, 3, 5, 10]:
+                    for column in [f'T_CPU_{cpu} [°C]', f'W_CPU_{cpu} [W]']:
+                        self.assertEqual(actual[column], source.get(column))
+                self.assertEqual(actual['Total heat load [W]'], source['Scheduled total power [W]'])
+                fr = actual['FR [%]']
+                fill = sheet.cell(row_index, headers.index('FR [%]') + 1).fill
+                self.assertEqual(fill.fgColor.rgb[-6:], colors[fr])
+                self.assertEqual(tool.filling_ratio_line_color(fr, 0), '#' + colors[fr])
+
     def test_zero_off_intervals_and_vector_plateaus(self):
         saved = saved_data()
         self.assertFalse(set(tool.SHIFT2DC_LEGACY_SCHEDULE_COLUMNS) & set(saved))
