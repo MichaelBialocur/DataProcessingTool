@@ -49,3 +49,19 @@ Run the focused calculation checks with:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Saved CPU powers in CSV files
+
+Raw and postprocessed Shift2DC CSVs retain the measured channels and only add
+`W_CPU_<ID>` for the selected CPUs. Off periods and individually unpowered CPUs
+contain `0`. Existing all-blank CPU rows from older schedule exports become zero.
+The five legacy schedule/total columns (`Heat_Load_Step`,
+`Heat_Load_Step_Start_s`, `Heat_Load_Step_End_s`, `Total_Heat_Load_W`, and
+`Scheduled_Power_Per_Board_W`) are removed when the file is processed.
+
+Reopening a test detects plateaus directly from the full set of CPU powers,
+including a change in load distribution with unchanged total power. Total power
+is calculated internally for reports, including transient plots. Boundaries use
+the recorded sample timestamps; consecutive intervals with identical per-CPU
+loads form one plateau. The final 100 seconds of each accepted plateau are used
+for averaging. Partial missing or invalid CPU loads still require correction.

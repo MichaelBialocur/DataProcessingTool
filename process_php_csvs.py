@@ -565,7 +565,12 @@ def transient_panels(detail, configuration):
     flow = values(['VFR_WATER', 'VFR', 'VFR_WATER_IN'] if medium == 'WATER' else
                   ['CFM', 'CFM_AIR', 'AIR_CFM', 'VFR_AIR', 'VFR', 'VFR_AIR_IN'])
     add('Coolant flow', meta['flow_unit'], {meta['flow_type']: flow})
-    power = values(['W_PSU', 'W_HEATER', 'Total_Heat_Load_W'])
+    cpu_power_columns = shift2dc_cpu_power_columns(data) if is_board_test_detail(detail) else {}
+    if cpu_power_columns:
+        cpu_powers = data[list(cpu_power_columns.values())].apply(pd.to_numeric, errors='coerce')
+        power = cpu_powers.sum(axis=1, min_count=len(cpu_power_columns))
+    else:
+        power = values(['W_PSU', 'W_HEATER', 'Total_Heat_Load_W'])
     volume = flow * cfm_to_m3_s if meta['flow_type'] == 'CFM' else flow/60000
     removal = ((water_density*water_cp if medium == 'WATER' else air_density*air_cp) * volume * (outlet-inlet))
     add('Heat load and coolant heat removal', 'Heat load [W]', {'Total heat load': power, 'W_OUT': removal})
@@ -7880,7 +7885,10 @@ def build_shift2dc_steps(data, config):
     return boards,steps,schedule
 
 
-SHIFT2DC_SAVED_STEP_COLUMNS = ('Heat_Load_Step', 'Heat_Load_Step_Start_s', 'Heat_Load_Step_End_s')
+SHIFT2DC_LEGACY_SCHEDULE_COLUMNS = (
+    'Heat_Load_Step', 'Heat_Load_Step_Start_s', 'Heat_Load_Step_End_s',
+    'Total_Heat_Load_W', 'Scheduled_Power_Per_Board_W',
+)
 
 
 def shift2dc_cpu_power_columns(data):
@@ -7897,42 +7905,41 @@ def shift2dc_cpu_power_columns(data):
 
 
 def clean_shift2dc_power_channels(data):
-    """Remove obsolete electrical PSU channels, preserving T_PSU temperatures."""
-    obsolete = [column for column in data.columns if re.fullmatch(
-        r'[WIV]_PSU(?:_\d+)?(?:_SP)?', re.split(r'[\[(]', str(column))[0].strip(), re.I)]
+    """Keep CPU loads and measured channels; remove legacy schedule/PSU exports."""
+    legacy = {name.casefold() for name in SHIFT2DC_LEGACY_SCHEDULE_COLUMNS}
+    obsolete = [column for column in data.columns
+                if str(column).strip().casefold() in legacy or re.fullmatch(
+                    r'[WIV]_PSU(?:_\d+)?(?:_SP)?', re.split(r'[\[(]', str(column))[0].strip(), re.I)]
     cleaned = data.drop(columns=obsolete).copy()
-    cpu_columns = shift2dc_cpu_power_columns(cleaned)
+    cpu_columns = list(shift2dc_cpu_power_columns(cleaned).values())
     if cpu_columns:
-        powers = cleaned[list(cpu_columns.values())].apply(pd.to_numeric, errors='coerce')
-        # Missing CPU loads mean unknown total, never silently sum a partial set.
-        cleaned['Total_Heat_Load_W'] = powers.sum(axis=1, min_count=len(cpu_columns))
-        uniform = powers.notna().all(axis=1) & powers.sub(powers.iloc[:,0],axis=0).abs().le(1e-8).all(axis=1)
-        cleaned['Scheduled_Power_Per_Board_W'] = powers.iloc[:,0].where(uniform)
+        # Earlier exports left every CPU blank before/after the applied schedule.
+        # Those are off intervals. Partial blanks/invalid readings remain visible
+        # to validation rather than silently becoming a partial or zero total.
+        off = cleaned[cpu_columns].isna().all(axis=1)
+        cleaned.loc[off, cpu_columns] = 0.0
     return cleaned
 
 
 def save_shift2dc_schedule_columns(data, boards, schedule):
-    """Persist entered loads; leave times outside the entered schedule unknown."""
+    """Persist only per-CPU loads, with zero before/after the applied schedule."""
     saved = clean_shift2dc_power_channels(data)
-    old_power = list(shift2dc_cpu_power_columns(saved).values())
-    saved = saved.drop(columns=old_power)
+    saved = saved.drop(columns=list(shift2dc_cpu_power_columns(saved).values()))
     power_columns = ["W_CPU_" + str(int(re.search(r"_(\d+)", column).group(1))) for column in boards]
-    for column in power_columns + list(SHIFT2DC_SAVED_STEP_COLUMNS):
-        saved[column] = np.nan
+    for column in power_columns:
+        saved[column] = 0.0
     t = shift2dc_time(saved)
     for row in schedule:
         mask = (t >= row['Start [s]']) & (t < row['End [s]'])
         saved.loc[mask, power_columns] = [row.get(c+' [W]', row['Power per board [W]']) for c in power_columns]
-        saved.loc[mask, list(SHIFT2DC_SAVED_STEP_COLUMNS)] = [row['Step'], row['Start [s]'], row['End [s]']]
-    return clean_shift2dc_power_channels(saved)
+    return saved
 
 
 def build_shift2dc_saved_steps(data):
-    """Recover plateaus from W_CPU channels without asking for an old schedule.
+    """Recover plateaus from changes in the complete CPU power vector.
 
-    Optional saved step boundaries retain exact averaging windows, including
-    adjacent steps at the same power and off-grid start/end times. Plain W_CPU
-    files are segmented at power changes and at blank/zero intervals.
+    Zero/blank intervals separate applied heat-load steps. Legacy schedule
+    metadata is ignored; boundaries are inferred from sample timestamps.
     """
     columns = shift2dc_cpu_power_columns(data)
     if not columns:
@@ -7951,13 +7958,6 @@ def build_shift2dc_saved_steps(data):
     if not active.any():
         raise ValueError('W_CPU columns exist but contain no positive heat-load steps. Remove empty W_CPU columns to enter a new schedule.')
     boards = shift2dc_columns_for_ids(data, columns.keys())
-    present = [name in data for name in SHIFT2DC_SAVED_STEP_COLUMNS]
-    if any(present) and not all(present):
-        raise ValueError('Saved heat-load step boundaries are incomplete. Restore all three Heat_Load_Step columns or remove them to use W_CPU plateaus.')
-    saved_bounds = all(present)
-    bounds = data[list(SHIFT2DC_SAVED_STEP_COLUMNS)].apply(pd.to_numeric, errors='coerce').to_numpy() if saved_bounds else None
-    if saved_bounds and not np.isfinite(bounds[active]).all():
-        raise ValueError('Saved heat-load step boundaries contain missing or invalid values.')
     steps, schedule = [], []
     index = 0
     while index < len(t):
@@ -7966,19 +7966,10 @@ def build_shift2dc_saved_steps(data):
             continue
         first = index
         while index+1 < len(t) and active[index+1] and np.allclose(powers[index+1], powers[first], rtol=0, atol=1e-8):
-            if saved_bounds and not np.array_equal(bounds[index+1], bounds[first]):
-                break
             index += 1
         stop = index+1
-        if saved_bounds:
-            _, start, end = bounds[first]
-            expected = np.flatnonzero((t >= start) & (t < end))
-            if (not np.isfinite(start+end) or end <= start or
-                    not np.array_equal(expected, np.arange(first, stop))):
-                raise ValueError('Saved step boundaries disagree with W_CPU plateaus. Correct the saved boundary columns or remove them to use the power trace.')
-        else:
-            start = t[first]
-            end = t[stop] if stop < len(t) else t[-1]+dt
+        start = t[first]
+        end = t[stop] if stop < len(t) else t[-1]+dt
         # Ignore short synchronization artifacts, consistently with 100 s averaging.
         if end-start >= 100-1e-8:
             config = dict(board_count=len(boards), board_columns=boards, start_s=float(start),
@@ -7988,8 +7979,6 @@ def build_shift2dc_saved_steps(data):
             new_schedule[0]['Step'] = len(schedule)+1
             steps.extend(new_steps)
             schedule.extend(new_schedule)
-        elif saved_bounds:
-            raise ValueError('Saved heat-load step is shorter than the required 100-second averaging window.')
         index = stop
     if not steps:
         raise ValueError('No W_CPU plateau lasts at least 100 seconds.')
