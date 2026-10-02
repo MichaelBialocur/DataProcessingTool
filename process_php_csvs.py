@@ -8019,6 +8019,25 @@ def build_shift2dc_saved_steps(data):
     return boards, steps, schedule
 
 
+def trim_shift2dc_cooldown(data):
+    """Keep recorded samples through 100 s after the last CPU power interval.
+
+    Called after saved-step validation. Use all powered samples, including a
+    short final interval excluded from steady-state averages, so no later heat
+    load is mistaken for cooldown. The first off sample marks the step end.
+    """
+    columns = list(shift2dc_cpu_power_columns(data).values())
+    if not columns:
+        return data
+    t = shift2dc_time(data)
+    powers = data[columns].apply(pd.to_numeric, errors='raise').to_numpy(dtype=float)
+    powered = np.flatnonzero(np.any(powers > 0, axis=1))
+    if not len(powered) or powered[-1] == len(t)-1:
+        return data
+    cutoff = t[powered[-1]+1] + 100.0
+    return data.loc[t <= cutoff].copy()
+
+
 def overwrite_shift2dc_csv(path, data):
     """Replace one CSV atomically so failed writes cannot truncate raw data."""
     path = Path(path)
@@ -8244,6 +8263,10 @@ def process_shift2dc_files(raw_files,output_folder,configurations=None,open_pdf_
         else:
             boards,steps,schedule=recovered
             print(f'Reused {len(schedule)} saved CPU heat-load step(s) from {path.name}.')
+        trimmed=trim_shift2dc_cooldown(data)
+        if len(trimmed) < len(data):
+            print(f'Removed {len(data)-len(trimmed)} rows more than 100 s after the final heat-load step from {path.name}.')
+        data=trimmed
         if not data.equals(original):
             overwrite_shift2dc_csv(path,data)
         test_results=[shift2dc_result(step,metadata,boards,row) for step,row in zip(steps,schedule)]

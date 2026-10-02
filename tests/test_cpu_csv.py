@@ -135,10 +135,81 @@ class CPUCsvTests(unittest.TestCase):
             first = tool.process_shift2dc_files([source], root/'out', configurations={name: config()}, open_pdf_when_done=False)
             raw = pd.read_csv(source)
             pd.testing.assert_frame_equal(raw, pd.read_csv(root/'out'/name))
+            self.assertEqual(raw.RelTime.iloc[-1], 510.)
+            self.assertEqual(len(raw), 511)
+            self.assertTrue((raw.loc[raw.RelTime >= 410, ['W_CPU_1', 'W_CPU_3', 'W_CPU_5']] == 0).all().all())
+            pd.testing.assert_frame_equal(raw, first['details'][0]['data'], check_dtype=False)
             self.assertFalse(set(tool.SHIFT2DC_LEGACY_SCHEDULE_COLUMNS) & set(raw))
             second = tool.process_shift2dc_files([source], root/'out', configurations={}, open_pdf_when_done=False)
             pd.testing.assert_frame_equal(pd.DataFrame(first['results']), pd.DataFrame(second['results']))
             pd.testing.assert_frame_equal(raw, pd.read_csv(source))
+
+    def test_existing_csv_cutoff_uses_seconds_and_preserves_averages(self):
+        name = 'Shift2DC_LTS_EVAP-demo_COND-demo_R1336mzzE_FR60_Water_TW25_VFR2p7_SS.csv'
+        time_grids = [np.arange(0, 601, dt) for dt in [.5, 1., 2.]]
+        time_grids.append(np.unique(np.r_[np.arange(0, 410, .8), 410.,
+                                          np.arange(411.3, 601, 1.7), 510., 510.1]))
+        for time in time_grids:
+            with self.subTest(samples=len(time)), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(tool, 'configure_report', return_value=({}, {})), \
+                 patch.object(tool, 'write_shift2dc_excel'), \
+                 patch.object(tool, 'write_shift2dc_pdf'), \
+                 patch.object(tool, 'show_shift2dc_dialog', side_effect=AssertionError('Unexpected schedule prompt')):
+                data = raw_data().iloc[np.zeros(len(time), dtype=int)].reset_index(drop=True)
+                data['RelTime'] = time
+                data['T_CPU_1'] = 35. + time / 100.
+                boards, _, schedule = tool.build_shift2dc_steps(data, config())
+                saved = tool.save_shift2dc_schedule_columns(data, boards, schedule)
+                boards, steps, schedule = tool.build_shift2dc_saved_steps(saved)
+                cutoff = schedule[-1]['End [s]'] + 100.
+                root = Path(tmp)
+                source = root/name
+                saved.to_csv(source, index=False)
+                first = tool.process_shift2dc_files([source], root/'out', open_pdf_when_done=False)
+                actual = pd.read_csv(source)
+                expected = saved.loc[saved.RelTime <= cutoff].reset_index(drop=True)
+                pd.testing.assert_frame_equal(actual, expected, check_dtype=False)
+                pd.testing.assert_frame_equal(actual, pd.read_csv(root/'out'/name))
+                for before, after in zip(steps, first['details'][0]['steps']):
+                    np.testing.assert_allclose(before['T_CPU_1'], after['T_CPU_1'])
+                second = tool.process_shift2dc_files([source], root/'out', open_pdf_when_done=False)
+                pd.testing.assert_frame_equal(pd.DataFrame(first['results']), pd.DataFrame(second['results']))
+                pd.testing.assert_frame_equal(actual, pd.read_csv(source))
+
+    def test_cooldown_preserves_short_tails_and_later_loads(self):
+        saved = saved_data()
+        for end in [410., 460., 510.]:
+            with self.subTest(end=end):
+                shorter = saved.loc[saved.RelTime <= end]
+                pd.testing.assert_frame_equal(tool.trim_shift2dc_cooldown(shorter), shorter)
+        # A brief final load is excluded from 100 s averages, but is still data.
+        saved.loc[520:529, 'W_CPU_5'] = 10.
+        extended = pd.concat([saved, saved.iloc[-1:].assign(RelTime=630.),
+                              saved.iloc[-1:].assign(RelTime=631.)], ignore_index=True)
+        tool.build_shift2dc_saved_steps(extended)
+        trimmed = tool.trim_shift2dc_cooldown(extended)
+        self.assertEqual(trimmed.RelTime.iloc[-1], 630.)
+        self.assertEqual(trimmed.loc[525, 'W_CPU_5'], 10.)
+        all_off = saved.copy()
+        all_off[['W_CPU_1', 'W_CPU_3', 'W_CPU_5']] = 0.
+        pd.testing.assert_frame_equal(tool.trim_shift2dc_cooldown(all_off), all_off)
+        powered_at_end = saved.copy()
+        powered_at_end.loc[410:, 'W_CPU_5'] = 10.
+        pd.testing.assert_frame_equal(tool.trim_shift2dc_cooldown(powered_at_end), powered_at_end)
+
+    def test_transient_recording_keeps_full_duration(self):
+        name = 'Shift2DC_LTS_EVAP-demo_COND-demo_R1336mzzE_FR60_Water_TW25_VFR2p7_TR.csv'
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(tool, 'configure_report', return_value=({}, {})), \
+             patch.object(tool, 'write_shift2dc_excel'), \
+             patch.object(tool, 'write_shift2dc_pdf'):
+            root = Path(tmp)
+            source = root/name
+            saved = saved_data()
+            saved.to_csv(source, index=False)
+            tool.process_shift2dc_files([source], root/'out', open_pdf_when_done=False)
+            pd.testing.assert_frame_equal(pd.read_csv(source), saved)
+            pd.testing.assert_frame_equal(pd.read_csv(root/'out'/name), saved)
 
 
 if __name__ == '__main__':

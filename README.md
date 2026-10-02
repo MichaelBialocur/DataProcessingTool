@@ -66,6 +66,15 @@ the recorded sample timestamps; consecutive intervals with identical per-CPU
 loads form one plateau. The final 100 seconds of each accepted plateau are used
 for averaging. Partial missing or invalid CPU loads still require correction.
 
+For steady-state Shift2DC tests, processing also trims the rewritten raw CSV
+and postprocessed CSV to **100 seconds after the final heat-load step**. The
+sample exactly at that cutoff is retained; later rows are deleted. This uses
+elapsed seconds, not a fixed number of samples, and works for both new schedules
+and existing `W_CPU` plateaus. Earlier off gaps and all powered intervals remain;
+recordings with less than 100 seconds of cooldown are not padded. Reprocessing
+keeps the same cutoff and plateau averages. Transient (`_TR`) recordings retain
+their full duration.
+
 ## Excel CPU columns and filling-ratio colors
 
 Each individual `T_CPU_<ID> [°C]` column is immediately followed by its matching
